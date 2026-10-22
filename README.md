@@ -142,11 +142,22 @@ look-n-see uses:
     "weigh-n-decide": {
       "type": "stdio",
       "command": "/absolute/path/to/weigh-n-decide/.venv/bin/weigh-n-decide",
+      "env": {
+        "OPENROUTER_API_KEY": "!/home/<user>/.local/bin/omp token openrouter"
+      },
       "timeout": 120000
     }
   }
 }
 ```
+
+The `!` prefix makes OMP run the command at spawn time and inject its stdout
+into the server's environment — the key comes from OMP's credential store
+(`omp token openrouter`), never from a committed file. The server reads env
+only, so this is the whole wiring. `selfhosted` needs no key, only
+`WEIGH_N_DECIDE_ENDPOINT` (also injectable here). `HF_TOKEN` rides the same
+path if an HF-hosted engine is ever added; v1's HF-hosted models (clef,
+decider) are self-served via SGLang/decider.serve and need none.
 
 ## Non-goals
 
