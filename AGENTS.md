@@ -2,45 +2,52 @@
 
 ## Project
 
-MCP server giving agents decision machinery: executing decision models
-(weighted criteria over alternatives), vision decision models (VLM-scored
-rubrics over images), and literal condition evaluation. Fifth in the collection
-(look-n-see, scrape-n-search, store-n-recall, listen-n-speak). **Status:
-docs-first, implementation not started** — the design lives in `README.md`
-(draft tool surface, formats, grammar, config) and `CONTEXT.md` (vocabulary).
-The open design questions at the bottom of README gate the spec; resolve them
-with the user before implementing.
+MCP server giving agents decisions: executing decision models
+(Jev/SystemOne-compatible endpoints — Clef, decider family, Mercury Decide,
+GPT-6 Luna Decisions), vision decision models (the same questions API over
+images), and literal condition evaluation (local, deterministic). Fifth in the
+collection (look-n-see, scrape-n-search, store-n-recall, listen-n-speak).
+**Status: docs-first, implementation not started** — the design lives in
+`README.md` (draft tool surface, questions API, engines, config) and
+`CONTEXT.md` (vocabulary). The open design questions at the bottom of README
+gate the spec; resolve them with the user before implementing.
 
 ## Conventions
 
-- Use `CONTEXT.md` terms exactly: decision model, alternative, criterion,
-  score, ranking, condition, fact, trace, kernel, engine, input triple,
-  question. They are not synonyms for anything else.
+- Use `CONTEXT.md` terms exactly: decision model, state, question, option,
+  answer, condition, fact, trace, engine, model, input triple,
+  vision-capable. They are not synonyms for anything else.
+- SystemOne fidelity: the questions API (`state`; `questions` typed `noul` /
+  `choice` / `score`; `instructions`; `criteria`; images) is mirrored as
+  defined by the Clef and decider model cards — validate inputs, pass
+  through, normalize only the response. Never invent request or response
+  fields the cards do not define.
 - Python 3.10+. Collection parity: setuptools src layout, package
   `weigh_n_decide`, console script `weigh-n-decide` (stdio transport), module
   `weigh_n_decide.server:main`. No second toolchain (Node/Cargo/…) without a
   stated reason the stdlib-plus-mcp baseline cannot serve.
 - Dependency baseline: `mcp>=2` + `httpx>=0.27` (parity with look-n-see's
-  `pyproject.toml`). Everything else stdlib; engines behind extras. Tests use
-  stdlib `unittest`, zero dev deps.
-- Determinism: `decide` and `evaluate` are pure local compute — no network, no
-  randomness, stable output ordering; same input → same ranking/verdict.
-  `vision_decide` is the only networked tool.
-- Stateless tools: models and facts are passed per call; nothing persisted
-  server-side.
-- Every tool returns structured output the calling model can act on (JSON
-  where it matters, not prose-only). Missing inputs, keys, or fact paths
-  degrade to clear errors, never tracebacks.
-- Engine pluggability follows look-n-see's pattern: engine param per call,
-  env-configured default, fallback chain.
+  `pyproject.toml`). Everything else stdlib. Tests use stdlib `unittest`,
+  zero dev deps.
+- Determinism split: `evaluate` is pure local compute — no network, no
+  randomness, stable ordering. `decide`/`vision_decide` are the only
+  networked tools, stateless HTTP per call.
+- Stateless tools: state, questions, and facts are passed per call; nothing
+  persisted server-side.
+- Every tool returns structured JSON the calling model can act on
+  (probabilities included — thresholding is the caller's job). Missing
+  inputs, unreachable endpoints, and non-vision-capable models degrade to
+  clear errors, never tracebacks.
+- Engine pluggability follows look-n-see's pattern: engine/model param per
+  call, env-configured default, fallback chain.
 - Config via environment variables (`WEIGH_N_DECIDE_*`) with sane defaults;
   secrets from env only, never hardcoded or committed.
-- OMP's default MCP request timeout is 30 s — `decide`/`evaluate` must stay
-  sub-second; `vision_decide` needs a raised registration timeout (README
-  shows 120 s).
+- OMP's default MCP request timeout is 30 s — `evaluate` must stay
+  sub-millisecond; `decide`/`vision_decide` need a raised registration
+  timeout (README shows 120 s).
 - Tool surface stays minimal (`decide`, `evaluate`, `vision_decide`). A new
-  tool needs a README row and a reason it cannot be a param; a new format,
-  operator, or env var needs a README update in the same change.
+  tool needs a README row and a reason it cannot be a param; a new engine,
+  question type, or env var needs a README update in the same change.
 
 ## Workflow
 
@@ -50,19 +57,20 @@ with the user before implementing.
 - When implementation starts, create `BRIEF.md` (requirements) and
   `IMPLEMENTATION.md` (design + release plan) like look-n-see, and keep them
   in sync with decisions made during implementation.
-- Docs precede code: a change to the tool surface, grammar, or formats lands
-  in README first, then implementation, in the same change.
+- Docs precede code: a change to the tool surface, grammar, or engine set
+  lands in README first, then implementation, in the same change.
 - One commit per logical change; conventional commits, imperative subject.
   Docs-only changes say so.
 
 ## Verification
 
 - `python -m compileall` / import smoke test after changes.
-- `python -m unittest discover -s tests -q` — the offline suite. The kernel
-  and condition evaluator are fully unit-testable; determinism (same input →
-  same output) is a test target.
-- Server must start and register tools with no keys present
-  (`decide`/`evaluate` fully functional offline; `vision_decide` errors
-  clearly on use, no network at startup).
-- Live VLM calls are manual smoke (a real MCP call through the harness), not
-  part of the suite.
+- `python -m unittest discover -s tests -q` — the offline suite: the
+  condition evaluator is fully unit-testable; engine request/response mapping
+  is table-driven against a fake `/v1/systemone` (stdlib `http.server`,
+  in-process). No network in tests.
+- Server must start and register tools with no keys and no reachable endpoint
+  — `evaluate` fully functional; `decide`/`vision_decide` error clearly on
+  use, no network at startup.
+- Live calls are manual smoke (a real MCP call through the harness against
+  SGLang/decider.serve or OpenRouter), not part of the suite.

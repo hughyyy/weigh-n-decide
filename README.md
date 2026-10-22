@@ -1,126 +1,124 @@
 # weigh-n-decide
 
 A lightweight [MCP](https://modelcontextprotocol.io) server that gives agents
-**decision machinery**: **decide** executes decision models — weighted criteria
-over alternatives, deterministic ranking — **evaluate** judges literal
-conditions against facts with no model in the loop, and **vision_decide**
-scores alternatives from images with a vision model before the same weighted
-kernel ranks them. Fifth in the collection: [look-n-see](../look-n-see)
-(vision/OCR), [scrape-n-search](../scrape-n-search) (web),
-[store-n-recall](../store-n-recall) (memory), [listen-n-speak](../listen-n-speak)
-(speech), weigh-n-decide (decisions).
+**decisions**: **decide** executes decision models — small, fast models that
+read a state and answer typed questions with calibrated probabilities
+(Clef, decider, Mercury Decide, GPT-6 Luna Decisions, …, all sharing the
+Jev/SystemOne API) — **vision_decide** runs the same questions API with images
+in the state, and **evaluate** judges literal conditions against facts
+locally, with no model in the loop. Fifth in the collection:
+[look-n-see](../look-n-see) (vision/OCR), [scrape-n-search](../scrape-n-search)
+(web), [store-n-recall](../store-n-recall) (memory),
+[listen-n-speak](../listen-n-speak) (speech), weigh-n-decide (decisions).
 
 > **Status: planned** — docs-first: this README is the draft spec, and the open
 > design questions at the bottom gate the final surface. Implementation starts
-> after they are resolved; then `BRIEF.md` (requirements) and
+> once they are resolved; then `BRIEF.md` (requirements) and
 > `IMPLEMENTATION.md` (design + release plan) are added, like look-n-see.
 
 ## The idea
 
-Three gaps this closes for an agent:
+- **Decision models are a model class built to be called, not chatted with.**
+  Instead of generating prose, they read a `state` (text, JSON, or images) and
+  answer typed `questions` — true/false, named choices, ordered scores — with
+  a probability for every option, in one forward pass. No output parsing,
+  calibrated confidence, latencies of tens of milliseconds (clef-flash median
+  38.8 ms on the Decision Index), costs of fractions of a cent ($0.02/M input
+  for Mercury Decide).
+- **An agent harness has none of this plumbing.** Each family (Cloudflare
+  Clef, Mapika decider, Inception Mercury, OpenAI Luna) ships its own server
+  or host; the wire format they share is the Jev/SystemOne API
+  (`POST /v1/systemone`). weigh-n-decide is the adapter: one stable MCP
+  surface in front of many decision-model backends, with per-call model
+  selection, env-configured defaults, and a fallback chain — the same engine
+  pattern as look-n-see's OCR dispatcher.
+- **Literal conditions stay local.** Compound boolean logic over facts is pure
+  math: a deterministic evaluator returns the right boolean plus a trace of
+  every sub-expression — auditable, reproducible, free. No model is consulted.
 
-- **Literal logic is where models are least reliable.** A long compound
-  condition over many facts — `a.status == "paid" and (a.total > 100 or a.trial)
-  and not a.vip` — is exactly what a model fumbles. A deterministic evaluator
-  returns the right boolean plus a **trace** of every sub-expression: auditable,
-  reproducible, identical on re-run. No tokens are spent re-reasoning logic that
-  is pure math.
-- **Weighted decision models make tradeoffs explicit data.** Criteria, weights,
-  and per-alternative scores live in a model that can be read, diffed, and
-  re-run; the ranking comes from arithmetic, not vibes. Changing a weight is a
-  one-line edit with an immediately comparable result.
-- **Vision decision models connect evidence to scoring.** A VLM looks at each
-  alternative's image and scores a rubric; the weighted kernel turns those
-  scores into a ranking. look-n-see can describe an image; weigh-n-decide turns
-  image evidence into a decision.
+## The questions API (Jev / SystemOne)
 
-The server is **stateless** — models and facts are passed in with each call and
-nothing is stored. Deterministic tools (`decide`, `evaluate`) never touch the
-network; `vision_decide` is the only networked call.
+All v1 backends speak one wire format, so the MCP surface mirrors it
+faithfully — the server validates and passes through, normalizing only the
+response:
+
+- `state` — string or JSON describing the situation to decide on.
+- `questions` — map of question id → question:
+  - `noul` — true/false; optional `criteria` descriptions for true and false.
+  - `choice` — named options; `criteria` maps option id → description.
+  - `score` — ordered legend (array of descriptions; index = score value).
+  - `instructions` — optional per-question instructions; the question id is
+    used when they are omitted.
+- Images (vision models) — `images`/`assets` in the request; see
+  `vision_decide`.
+
+Response: `model`, `answers` keyed by question id, `usage`. An answer carries
+`choice` + `confidence` + `probabilities` (choice), `score` + `confidence` +
+`legend` + `probabilities` (score), or the probability of true (noul). The
+probabilities are the point: every option's full distribution comes back, so
+the caller can threshold, compare, or defer.
 
 ## Tool surface (draft)
 
 | Tool | Params | Returns |
 | --- | --- | --- |
-| `decide` | `model` (required: criteria + weights + alternatives + scores), `format`? (default `weighted`) | ranking: per-alternative weighted total, rank, per-criterion contributions, tie flags, gap warnings (unscored criteria) |
-| `evaluate` | `conditions` (required: one expression or list), `facts`? (JSON object) | per-condition boolean `result` + `trace` of every sub-expression; optional `all`/`any` aggregate |
-| `vision_decide` | `criteria` (required: id, weight, question), `alternatives` (required: id + image), `engine`?, `model`? | per-alternative per-criterion scores + one-line rationale, then the `decide` ranking |
+| `decide` | `state` (required: string or JSON), `questions` (required: map of typed questions), `model`?, `engine`? | `answers` per question id (normalized), `model`, `usage` |
+| `vision_decide` | same as `decide` plus `images` (required: list of input-triple entries, optional `ref` each) | same; images folded into the state per backend convention |
+| `evaluate` | `conditions` (required: one expression or list), `facts`? (JSON object) | per-condition boolean `result` + `trace`; optional `all`/`any` aggregate |
 
-Input and output discipline (house rules): images use the same input triple as
-look-n-see (file path / base64 `data:` URI / `http(s)://` URL); every tool
-returns structured JSON the calling model can act on, never prose-only.
+House rules: images use the same input triple as look-n-see (file path /
+base64 `data:` URI / `http(s)://` URL); every tool returns structured JSON,
+never prose-only; `evaluate` never touches the network.
 
-## Decision models (draft)
+## Backends (draft)
 
-Canonical `weighted` format — the only one committed for v1:
+| Engine | Endpoint | Models | Needs |
+| --- | --- | --- | --- |
+| `selfhosted` | any `POST /v1/systemone` base URL — SGLang serving Clef, `decider.serve` | clef, clef-flash, decider-2b/4b/12b/12b-vision/31b/35b-a3b | local or reachable server; no key |
+| `openrouter` | OpenRouter's System One endpoint | inception/mercury-decide (and `:free`), openai/gpt-6-luna-decisions | `OPENROUTER_API_KEY` |
 
-```json
-{
-  "criteria": [
-    {"id": "cost",  "weight": 0.4, "direction": "minimize"},
-    {"id": "speed", "weight": 0.6}
-  ],
-  "alternatives": [
-    {"id": "cli",   "scores": {"cost": 9, "speed": 8}},
-    {"id": "cloud", "scores": {"cost": 6, "speed": 9}}
-  ]
-}
-```
+Selection per call via `engine=`/`model=`, default via env, fallback chain
+after failure — identical semantics to look-n-see's OCR dispatcher. A plain
+instruct model (Muse2-230M and friends) is not SystemOne-compatible and is out
+of scope for v1.
 
-- Scores are 0–10 (one decimal); `direction` defaults to `maximize`;
-  `minimize` inverts the score before summing (a low cost score is *good*).
-- Weights need not sum to 1; the kernel normalizes internally and reports the
-  share each criterion contributed to each alternative's total.
-- Missing scores are **gaps**: reported per alternative;
-  `require_complete=true` turns gaps into an error instead.
-- Ties are detected and reported, never broken silently.
+## Vision decision models
 
-`jev` is the other format named for `format=`; its definition is an open
-question gating this surface (see below). The engine behind `decide` is
-format-agnostic: a loader turns any format into the canonical model, and one
-arithmetic kernel ranks it.
+`vision_decide` is `decide` with images in the state — the same typed
+questions, answered about picture evidence. Vision-capable models: clef /
+clef-flash (images and video), decider-2b v12+ (assets referenced from the
+state, PNG/JPEG, max 4), decider-12b-vision, decider-31b. The tool accepts the
+input triple per image with an optional `ref`; adapters map to backend
+convention (clef `images` list; decider `assets` map the state references by
+key). Routing a non-vision-capable model with images fails with a clear error
+naming which models would work.
 
 ## Literal conditions (draft)
 
 A small whitelisted grammar — recursive-descent parser, no `eval()`, nothing
 but literals, fact paths, and these operators:
 
-- Boolean: `and`, `or`, `not`, parentheses; short-circuit evaluation (the trace
-  records where it stopped)
+- Boolean: `and`, `or`, `not`, parentheses; short-circuit evaluation (the
+  trace records where it stopped)
 - Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not in`, `contains`
 - Operands: JSON literals (`5`, `"paid"`, `true`, `null`, `[1, 2]`), and
   **fact paths** — dotted/indexed references into `facts` (`a.total`,
   `items[0].price`, `user.roles`)
 
-Facts are a JSON object passed per call. A missing fact path is an error, not a
-silent `false`. Arithmetic and functions are open questions (see below); the
-v1 grammar is comparisons over literals only.
-
-## Vision decision models (draft)
-
-`vision_decide` = rubric + evidence → scores → ranking:
-
-1. Each criterion carries a `question` (the scoring prompt) — "how well does
-   this UI handle a first-run user?", answered 0–10.
-2. Each alternative carries one image via the input triple.
-3. One VLM call per alternative scores **all** criteria for that image (rubric
-   in the prompt, score + rationale per criterion) — N calls for N
-   alternatives, issued in parallel.
-4. Scores feed the same weighted kernel as `decide`; output adds per-criterion
-   rationale next to each score.
-
-Engines follow look-n-see's pattern: OpenRouter / HuggingFace Inference, engine
-param per call, env-configured default, fallback chain, clear error without
-keys.
+Facts are a JSON object passed per call. A missing fact path is an error, not
+a silent `false`. Arithmetic and functions are deliberately out of v1 scope
+(decided with the user); the grammar can grow later without changing the
+surface.
 
 ## Configuration (draft)
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `WEIGH_N_DECIDE_VISION_ENGINE` | `openrouter` | default vision engine |
-| `WEIGH_N_DECIDE_VISION_MODEL` | engine-dependent | default VLM |
-| `WEIGH_N_DECIDE_VISION_FALLBACKS` | — | fallback chain tried after the default fails |
-| `OPENROUTER_API_KEY` / `HF_TOKEN` | — | secrets, env only (same as look-n-see) |
+| `WEIGH_N_DECIDE_ENGINE` | `selfhosted` | default engine |
+| `WEIGH_N_DECIDE_ENDPOINT` | — | base URL for `selfhosted` (SGLang / decider.serve) |
+| `WEIGH_N_DECIDE_MODEL` | engine-dependent | default decision model |
+| `WEIGH_N_DECIDE_FALLBACKS` | — | fallback engines/models tried after the default fails |
+| `OPENROUTER_API_KEY` | — | `openrouter` engine only; env only, never committed |
 
 ## Install
 
@@ -132,8 +130,9 @@ python3 -m venv .venv
 
 ### Register with Oh My Pi
 
-`decide`/`evaluate` run fine at default timeouts (sub-millisecond local
-compute); `vision_decide` needs the raised timeout look-n-see uses:
+`evaluate` runs at default timeouts (pure local compute); `decide`/
+`vision_decide` call remote models — register with the raised timeout
+look-n-see uses:
 
 ```json
 {
@@ -149,23 +148,26 @@ compute); `vision_decide` needs the raised timeout look-n-see uses:
 
 ## Non-goals
 
-- No model storage, no saved sessions — stateless; persistent memory is
+- No local weight loading (torch/GPU) — backends are HTTP endpoints; serving
+  SGLang/decider.serve is the operator's job.
+- No prompting adapter for plain instruct models in v1 — Muse2-230M etc. are
+  not SystemOne models.
+- No weighted-criteria scoring engine — rubrics are expressed as `score`
+  questions; the decision models are the scorer.
+- No model storage, no sessions — stateless; persistent memory is
   store-n-recall's job.
-- No LLM in `decide`/`evaluate` — deterministic tools stay deterministic; the
-  only model call is `vision_decide`.
-- No probabilistic/Bayesian/AHP variants in v1 — one kernel, executed well.
-- No visualizations or UI — rankings and verdicts are JSON.
+- No visualizations — answers, probabilities, and traces are JSON.
 
 ## Open design questions (gating the spec)
 
-1. **Jev format** — what is the `jev` decision-model format (spec, or where it
-   is defined)? Gates `format=` beyond the canonical `weighted`.
-2. **Vision semantics** — is VLM-as-rubric-scorer the intended reading of
-   "vision decision models", or pairwise image comparison (VLM picks a winner
-   per pair; ranking from win counts)?
-3. **Condition grammar scope** — arithmetic inside comparisons (`+ - * / %`)?
-   Functions (`len`, `count`)? The v1 draft is comparisons over literals only.
-4. **Score scale policy** — fixed 0–10 with one decimal, or accept any numeric
-   scale and normalize? Interaction with `direction`.
-5. **vision_decide budget** — one call per alternative (batched rubric) vs one
-   per criterion; timeout headroom for N alternatives.
+1. **OpenRouter System One route** — exact endpoint path and auth for
+   mercury-decide / gpt-6-luna-decisions, and response-shape parity with
+   `/v1/systemone`.
+2. **Jev itself** — where is a Jev endpoint reachable (self-hosted? a host?),
+   or do Clef/decider/Mercury cover the v1 slate?
+3. **Image convention unification** — clef `images` list vs decider `assets`
+   refs: normalize at the MCP surface, or pass through per backend?
+4. **Model registry** — static `models.json` (name → engine, id,
+   vision-capable, max images) vs env-only configuration.
+5. **Score answers** — confirm `score`/`legend`/`confidence` field parity
+   across backends.

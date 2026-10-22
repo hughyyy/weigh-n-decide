@@ -1,38 +1,38 @@
 # weigh-n-decide
 
-A lightweight MCP server that gives agents decision machinery: executing weighted decision models over alternatives, scoring alternatives from images with a vision model, and evaluating literal conditions against facts.
+A lightweight MCP server that gives agents decisions: executing decision models (Jev/SystemOne-compatible endpoints) over a state and typed questions, running the same questions API with images in the state, and evaluating literal conditions against facts locally.
 
 ## Language
 
 ### Artifacts
 
 **Decision model**:
-The structured input to `decide`: criteria with weights and directions, alternatives with per-criterion scores. Format-checked before execution; the canonical format is `weighted`.
-_Avoid_: matrix, rubric (the rubric is the vision scoring prompt, not the model), model (ambiguous — say decision model or VLM)
+A model that reads a state and answers typed questions with a probability for every option, in one pass — no prose generation. Reached as a Jev/SystemOne endpoint: clef, decider family, Mercury Decide, GPT-6 Luna Decisions.
+_Avoid_: LLM, chat model, classifier (broader), judge, scorer
 
-**Alternative**:
-One candidate being ranked. Has an id, optional human label, and scores — or, in `vision_decide`, an image that gets scored.
-_Avoid_: option, candidate, choice, item
+**State**:
+The situation being decided on: a string or JSON value, optionally referencing images. Passed per call, never stored.
+_Avoid_: input, context, prompt, content
 
-**Criterion**:
-One weighted dimension of a decision: id, weight, direction (`maximize` default, `minimize` inverts before summing).
-_Avoid_: factor, dimension, aspect, metric
+**Question**:
+One typed ask about the state — `noul` (true/false), `choice` (named options), `score` (ordered legend) — with optional `instructions`. The question id names the ask when instructions are omitted.
+_Avoid_: task, query, criterion (criteria describe choice options; they are not the question)
 
-**Score**:
-The numeric grade (0–10) of one alternative on one criterion. Passed explicitly in `decide`; produced by the vision engine in `vision_decide`.
-_Avoid_: rating, value, weight (a weight belongs to a criterion, not an alternative)
+**Option**:
+One allowed answer of a question: an option id with a description (`choice`), a legend entry (`score`), or true/false (`noul`).
+_Avoid_: choice (that is the answer's field name), alternative, label
 
-**Ranking**:
-The output of decision-model execution: alternatives ordered by weighted total, with per-criterion contributions, shares, gaps, and ties.
-_Avoid_: result, decision (that is the human's call), winner
+**Answer**:
+The normalized response for one question: `choice` + `confidence` + `probabilities`, `score` + `confidence` + `legend` + `probabilities`, or the probability of true (`noul`). The full distribution is the point — thresholding happens in the caller.
+_Avoid_: result, verdict, decision (that is the human's call)
 
 **Condition**:
 One literal boolean expression evaluated against facts, producing a result plus a trace. Evaluated deterministically — no model in the loop.
-_Avoid_: rule (a rule set would be a grouping of conditions, not v1 scope), expression (fine internally, not in docs), predicate
+_Avoid_: rule, expression (fine internally, not in docs), predicate
 
 **Fact**:
 The JSON object a condition reads through fact paths. A missing path is an error, never a silent false.
-_Avoid_: data, context, state, variables
+_Avoid_: data, context, state (reserved for decision models)
 
 **Trace**:
 The per-node record of one condition's evaluation: sub-expression values, short-circuit points, resolved fact paths.
@@ -40,18 +40,18 @@ _Avoid_: log, audit, proof
 
 ### Machinery
 
-**Kernel**:
-The one arithmetic module that turns a canonical decision model into a ranking. All formats load into it; nothing else computes scores.
-_Avoid_: engine (reserved for vision engines), calculator, evaluator
-
 **Engine**:
-A swappable VLM implementation behind `vision_decide` — OpenRouter or HuggingFace Inference. Selected per call, env-configured default, fallback chain. Same pattern as look-n-see.
-_Avoid_: backend, provider, model (an engine has a model; it is not one)
+A swappable adapter behind `decide`/`vision_decide` that turns MCP calls into `POST /v1/systemone` requests — `selfhosted` (SGLang Clef, decider.serve) or `openrouter`. Selected per call, env-configured default, fallback chain.
+_Avoid_: backend, provider, model (an engine routes models; it is not one)
+
+**Model**:
+The specific decision model an engine routes to — `clef`, `decider-2b`, `inception/mercury-decide`. Selected per call, env-configured default.
+_Avoid_: engine, endpoint
 
 **Input triple**:
-The three accepted image forms in `vision_decide`: file path, base64 `data:` URI, `http(s)://` URL. Same normalization as look-n-see.
+The three accepted image forms: file path, base64 `data:` URI, `http(s)://` URL. Same normalization as look-n-see; adapters convert to backend convention.
 _Avoid_: image source, uri (only one of the three)
 
-**Question**:
-The per-criterion scoring prompt a vision engine answers with a 0–10 score and a one-line rationale.
-_Avoid_: prompt (too broad), criterion (the question belongs to one)
+**Vision-capable**:
+A decision model that reads images (sometimes video) as part of the state — clef/clef-flash, decider-2b v12+, decider-12b-vision, decider-31b. Routing a non-vision-capable model with images is an error, not a silent text-only call.
+_Avoid_: multimodal (vague), image model, VLM (these models do not chat)
