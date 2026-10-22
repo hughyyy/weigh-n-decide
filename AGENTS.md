@@ -7,10 +7,10 @@ MCP server giving agents decisions: executing decision models
 GPT-6 Luna Decisions), vision decision models (the same questions API over
 images), and literal condition evaluation (local, deterministic). Fifth in the
 collection (look-n-see, scrape-n-search, store-n-recall, listen-n-speak).
-**Status: docs-first, implementation not started** — the design lives in
-`README.md` (draft tool surface, questions API, engines, config) and
-`CONTEXT.md` (vocabulary). The open design questions at the bottom of README
-gate the spec; resolve them with the user before implementing.
+**Status: v1 implemented** — `BRIEF.md` (requirements), `IMPLEMENTATION.md`
+(design), `README.md` (user-facing surface), `CONTEXT.md` (vocabulary). The
+remaining open questions at the bottom of README gate only what is not yet
+built; resolve them with the user before building more.
 
 ## Conventions
 

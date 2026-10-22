@@ -11,10 +11,10 @@ locally, with no model in the loop. Fifth in the collection:
 (web), [store-n-recall](../store-n-recall) (memory),
 [listen-n-speak](../listen-n-speak) (speech), weigh-n-decide (decisions).
 
-> **Status: planned** — docs-first: this README is the draft spec, and the open
-> design questions at the bottom gate the final surface. Implementation starts
-> once they are resolved; then `BRIEF.md` (requirements) and
-> `IMPLEMENTATION.md` (design + release plan) are added, like look-n-see.
+> **Status: v1 implemented** — tools, engines, registry, and condition
+> evaluator are live (76-test offline suite; `scripts/stdio_smoke.py` drives
+> the real stdio server). `BRIEF.md` holds requirements, `IMPLEMENTATION.md`
+> the design. The open questions at the bottom gate only what remains.
 
 ## The idea
 
@@ -58,7 +58,7 @@ Response: `model`, `answers` keyed by question id, `usage`. An answer carries
 probabilities are the point: every option's full distribution comes back, so
 the caller can threshold, compare, or defer.
 
-## Tool surface (draft)
+## Tool surface
 
 | Tool | Params | Returns |
 | --- | --- | --- |
@@ -70,7 +70,7 @@ House rules: images use the same input triple as look-n-see (file path /
 base64 `data:` URI / `http(s)://` URL); every tool returns structured JSON,
 never prose-only; `evaluate` never touches the network.
 
-## Backends (draft)
+## Backends
 
 | Engine | Endpoint | Models | Needs |
 | --- | --- | --- | --- |
@@ -93,7 +93,7 @@ convention (clef `images` list; decider `assets` map the state references by
 key). Routing a non-vision-capable model with images fails with a clear error
 naming which models would work.
 
-## Literal conditions (draft)
+## Literal conditions
 
 A small whitelisted grammar — recursive-descent parser, no `eval()`, nothing
 but literals, fact paths, and these operators:
@@ -110,14 +110,16 @@ a silent `false`. Arithmetic and functions are deliberately out of v1 scope
 (decided with the user); the grammar can grow later without changing the
 surface.
 
-## Configuration (draft)
+## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `WEIGH_N_DECIDE_ENGINE` | `selfhosted` | default engine |
 | `WEIGH_N_DECIDE_ENDPOINT` | — | base URL for `selfhosted` (SGLang / decider.serve) |
 | `WEIGH_N_DECIDE_MODEL` | engine-dependent | default decision model |
-| `WEIGH_N_DECIDE_FALLBACKS` | — | fallback engines/models tried after the default fails |
+| `WEIGH_N_DECIDE_FALLBACKS` | — | fallback engines/models tried after the default fails (`engine:model` or `model`, comma-separated) |
+| `WEIGH_N_DECIDE_OPENROUTER_URL` | `https://openrouter.ai/api/v1/systemone` | full System One endpoint for the `openrouter` engine (route unverified — open question) |
+| `WEIGH_N_DECIDE_TIMEOUT` | `60` | per-request HTTP timeout in seconds |
 | `OPENROUTER_API_KEY` | — | `openrouter` engine only; env only, never committed |
 
 ## Install
@@ -158,16 +160,16 @@ look-n-see uses:
   store-n-recall's job.
 - No visualizations — answers, probabilities, and traces are JSON.
 
-## Open design questions (gating the spec)
+## Open questions (remaining)
 
-1. **OpenRouter System One route** — exact endpoint path and auth for
-   mercury-decide / gpt-6-luna-decisions, and response-shape parity with
-   `/v1/systemone`.
+1. **OpenRouter System One route** — the default `…/api/v1/systemone` is a
+   working guess (`WEIGH_N_DECIDE_OPENROUTER_URL` overrides it); verify the
+   real route and auth for mercury-decide / gpt-6-luna-decisions, plus
+   response-shape parity with `/v1/systemone`.
 2. **Jev itself** — where is a Jev endpoint reachable (self-hosted? a host?),
    or do Clef/decider/Mercury cover the v1 slate?
-3. **Image convention unification** — clef `images` list vs decider `assets`
-   refs: normalize at the MCP surface, or pass through per backend?
-4. **Model registry** — static `models.json` (name → engine, id,
-   vision-capable, max images) vs env-only configuration.
-5. **Score answers** — confirm `score`/`legend`/`confidence` field parity
+3. **Score answers** — confirm `score`/`legend`/`confidence` field parity
    across backends.
+
+Resolved questions (vision semantics, grammar scope, image conventions,
+registry format) are recorded in `IMPLEMENTATION.md`.
