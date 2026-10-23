@@ -21,11 +21,21 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["ConditionError", "evaluate_condition", "evaluate_conditions"]
+__all__ = ["ConditionError", "evaluate_condition", "evaluate_conditions", "parse"]
 
 
 class ConditionError(ValueError):
     """Raised for syntax errors, unknown tokens, type mismatches, and failed fact paths."""
+
+
+# Bounds on hostile or generated input. 20 KiB and 5,000 tokens are far
+# beyond any readable condition while keeping parse/evaluate time bounded.
+_MAX_SOURCE_LENGTH = 20_000
+_MAX_TOKENS = 5_000
+
+# Bound on explicit nesting ("(", "not", list literals). Keeps hostile or
+# generated input from exhausting the interpreter stack.
+_MAX_NESTING = 100
 
 
 # --------------------------------------------------------------------------
@@ -34,7 +44,7 @@ class ConditionError(ValueError):
 _TOKEN_RE = re.compile(
     r"""
       (?P<ws>\s+)
-    | (?P<number>\d+(?:\.\d+)?)
+    | (?P<number>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)
     | (?P<string>'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*")
     | (?P<op>==|!=|<=|>=|<|>|\(|\)|\[|\]|,|\.|-)
     | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
@@ -72,11 +82,33 @@ def _tokenize(src: str) -> list[_Token]:
         kind = match.lastgroup
         if kind != "ws":
             tokens.append(_Token(kind, match.group(), pos, match.end()))
+            if len(tokens) > _MAX_TOKENS:
+                raise ConditionError(
+                    f"condition is too complex: more than {_MAX_TOKENS} tokens"
+                )
         pos = match.end()
     return tokens
 
 
-_ESCAPES = {"\\": "\\", "'": "'", '"': '"', "n": "\n", "t": "\t", "r": "\r"}
+_ESCAPES = {
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "t": "\t",
+    "r": "\r",
+}
+_HEX4_RE = re.compile(r"[0-9A-Fa-f]{4}\Z")
+
+
+def _hex4(body: str, at: int, position: int) -> int:
+    hexpart = body[at : at + 4]
+    if not _HEX4_RE.fullmatch(hexpart):
+        raise ConditionError(f"invalid \\u escape at position {position}")
+    return int(hexpart, 16)
 
 
 def _unescape(body: str, start: int) -> str:
@@ -84,6 +116,10 @@ def _unescape(body: str, start: int) -> str:
     i = 0
     while i < len(body):
         ch = body[i]
+        if ch in "\n\r":
+            raise ConditionError(
+                f"unescaped newline in string literal at position {start + i}"
+            )
         if ch != "\\":
             out.append(ch)
             i += 1
@@ -92,15 +128,18 @@ def _unescape(body: str, start: int) -> str:
             raise ConditionError(f"unterminated escape at position {start + i}")
         esc = body[i + 1]
         if esc == "u":
-            hexpart = body[i + 2 : i + 6]
-            if len(hexpart) != 4:
-                raise ConditionError(
-                    f"invalid \\u escape at position {start + i} (need 4 hex digits)"
-                )
-            try:
-                out.append(chr(int(hexpart, 16)))
-            except ValueError as exc:
-                raise ConditionError(f"invalid \\u escape at position {start + i}") from exc
+            code = _hex4(body, i + 2, start + i)
+            # JSON escape semantics: a high surrogate followed by a low
+            # surrogate is one character, not two lone code units.
+            if 0xD800 <= code <= 0xDBFF and body[i + 6 : i + 8] == "\\u":
+                low = _hex4(body, i + 8, start + i + 6)
+                if 0xDC00 <= low <= 0xDFFF:
+                    out.append(
+                        chr(0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00))
+                    )
+                    i += 12
+                    continue
+            out.append(chr(code))
             i += 6
             continue
         if esc not in _ESCAPES:
@@ -108,6 +147,17 @@ def _unescape(body: str, start: int) -> str:
         out.append(_ESCAPES[esc])
         i += 2
     return "".join(out)
+
+
+def _number_value(text: str) -> int | float:
+    try:
+        return float(text) if ("." in text or "e" in text or "E" in text) else int(text)
+    except ValueError as exc:
+        raise ConditionError(f"invalid number literal {text!r}") from exc
+
+
+def _is_integer_literal(text: str) -> bool:
+    return "." not in text and "e" not in text and "E" not in text
 
 
 # --------------------------------------------------------------------------
@@ -118,6 +168,7 @@ class _Parser:
         self.src = src
         self.tokens = _tokenize(src)
         self.i = 0
+        self.depth = 0
 
     # -- token helpers -----------------------------------------------------
 
@@ -154,6 +205,16 @@ class _Parser:
     def _unexpected(self, tok: _Token) -> ConditionError:
         return ConditionError(f"unexpected token {tok.value!r} at position {tok.start}")
 
+    def _enter(self) -> None:
+        self.depth += 1
+        if self.depth > _MAX_NESTING:
+            raise ConditionError(
+                f"expression nests deeper than {_MAX_NESTING} levels"
+            )
+
+    def _leave(self) -> None:
+        self.depth -= 1
+
     # -- grammar -----------------------------------------------------------
 
     def parse(self) -> dict:
@@ -188,38 +249,38 @@ class _Parser:
     def _parse_unary(self) -> dict:
         if self._at_kw("not") and not self._at_kw("in", ahead=1):
             tok = self._next()
-            part = self._parse_unary()
+            self._enter()
+            try:
+                part = self._parse_unary()
+            finally:
+                self._leave()
             return {"kind": "not", "part": part, "start": tok.start, "text": self._text(tok.start)}
-        return self._parse_atom()
-
-    def _parse_atom(self) -> dict:
-        if self._at_op("("):
-            self._next()
-            node = self._parse_or()
-            self._expect("op", ")")
-            return node
         return self._parse_comparison()
 
     def _parse_comparison(self) -> dict:
         left = self._parse_operand()
         tok = self._peek()
-        if tok is None:
-            return {"kind": "truthy", "operand": left, "start": left["start"], "text": self._text(left["start"])}
         op: str | None = None
-        if tok.kind == "op" and tok.value in _CMP_OPS:
-            self._next()
-            op = tok.value
-        elif self._at_kw("in"):
-            self._next()
-            op = "in"
-        elif self._at_kw("contains"):
-            self._next()
-            op = "contains"
-        elif self._at_kw("not", ahead=0) and self._at_kw("in", ahead=1):
-            self._next()
-            self._next()
-            op = "not in"
+        if tok is not None:
+            if tok.kind == "op" and tok.value in _CMP_OPS:
+                self._next()
+                op = tok.value
+            elif self._at_kw("in"):
+                self._next()
+                op = "in"
+            elif self._at_kw("contains"):
+                self._next()
+                op = "contains"
+            elif self._at_kw("not", ahead=0) and self._at_kw("in", ahead=1):
+                self._next()
+                self._next()
+                op = "not in"
         if op is None:
+            # A parenthesized expression already carries its own value (and
+            # may be boolean); a bare operand in boolean position gets a
+            # truthiness node so its trace shows the coercion.
+            if left["kind"] == "group":
+                return left
             return {"kind": "truthy", "operand": left, "start": left["start"], "text": self._text(left["start"])}
         right = self._parse_operand()
         return {
@@ -235,13 +296,12 @@ class _Parser:
         tok = self._next()
         start = tok.start
         if tok.kind == "number":
-            value: object = float(tok.value) if "." in tok.value else int(tok.value)
-            return {"kind": "lit", "value": value, "start": start, "text": self._text(start)}
+            return {"kind": "lit", "value": _number_value(tok.value), "start": start, "text": self._text(start)}
         if tok.kind == "op" and tok.value == "-":
             num = self._next()
             if num.kind != "number":
                 raise self._unexpected(num)
-            value = -(float(num.value) if "." in num.value else int(num.value))
+            value = -_number_value(num.value)
             return {"kind": "lit", "value": value, "start": start, "text": self._text(start)}
         if tok.kind == "string":
             value = _unescape(tok.value[1:-1], tok.start + 1)
@@ -256,26 +316,47 @@ class _Parser:
             return self._parse_path(tok)
         if tok.kind == "op" and tok.value == "[":
             return self._parse_list_literal(start)
+        if tok.kind == "op" and tok.value == "(":
+            self._enter()
+            try:
+                node = self._parse_or()
+                self._expect("op", ")")
+            finally:
+                self._leave()
+            # A lone parenthesized value (`(a)`, `(1)`) must stay a value so
+            # `(a.total) > 100` compares numbers rather than booleans.
+            if node["kind"] == "truthy":
+                node = node["operand"]
+            return {
+                "kind": "group",
+                "part": node,
+                "start": start,
+                "text": self._text(start),
+            }
         raise self._unexpected(tok)
 
     def _parse_list_literal(self, start: int) -> dict:
         """A literal list: comma-separated literals (no fact paths — reference
         a list from facts instead)."""
-        items: list[object] = []
-        if not self._at_op("]"):
-            while True:
-                item = self._parse_operand()
-                if item["kind"] != "lit":
-                    raise ConditionError(
-                        f"list literal at position {item['start']} must contain "
-                        f"literals only (got a fact path)"
-                    )
-                items.append(item["value"])
-                if self._at_op(","):
-                    self._next()
-                    continue
-                break
-        self._expect("op", "]")
+        self._enter()
+        try:
+            items: list[object] = []
+            if not self._at_op("]"):
+                while True:
+                    item = self._parse_operand()
+                    if item["kind"] != "lit":
+                        raise ConditionError(
+                            f"list literal at position {item['start']} must contain "
+                            f"literals only (got a fact path)"
+                        )
+                    items.append(item["value"])
+                    if self._at_op(","):
+                        self._next()
+                        continue
+                    break
+            self._expect("op", "]")
+        finally:
+            self._leave()
         return {"kind": "lit", "value": items, "start": start, "text": self._text(start)}
 
     def _parse_path(self, first: _Token) -> dict:
@@ -298,7 +379,7 @@ class _Parser:
                 if idx_tok.kind == "op" and idx_tok.value == "-":
                     sign = -1
                     idx_tok = self._next()
-                if idx_tok.kind != "number" or "." in idx_tok.value:
+                if idx_tok.kind != "number" or not _is_integer_literal(idx_tok.value):
                     raise ConditionError(
                         f"expected an integer index at position {idx_tok.start}, got {idx_tok.value!r}"
                     )
@@ -405,6 +486,9 @@ def _eval(node: dict, facts: dict) -> tuple[object, dict]:
         value, child = _eval(node["operand"], facts)
         result = _truthy(value)
         return result, {"expr": node["text"], "value": result, "op": "truthy", "of": child}
+    if kind == "group":
+        value, child = _eval(node["part"], facts)
+        return value, {"expr": node["text"], "value": value, "op": "group", "child": child}
     if kind == "not":
         value, child = _eval(node["part"], facts)
         result = not _truthy(value)
@@ -506,6 +590,10 @@ def parse(expr: str) -> dict:
     """Parse one condition expression into an AST (exposed for tests/tools)."""
     if not isinstance(expr, str) or not expr.strip():
         raise ConditionError("condition must be a non-empty string")
+    if len(expr) > _MAX_SOURCE_LENGTH:
+        raise ConditionError(
+            f"condition is too long: {len(expr)} characters (max {_MAX_SOURCE_LENGTH})"
+        )
     return _Parser(expr).parse()
 
 
