@@ -49,12 +49,14 @@ _VISION_CAPABLE = sorted(
 
 
 def resolve_model(
-    model: str | None, engine: str | None, default_model: str, default_engine: str
+    model: str | None, engine: str | None, default_model: str, default_engine: str | None
 ) -> tuple[str, str, ModelInfo]:
     """Resolve a model/engine pair to (engine, model_id, info).
 
     A model containing "/" that is not in the registry is treated as an
-    OpenRouter id. Bare unknown names are an error naming the known models.
+    OpenRouter id. An explicit engine (per call or configured default) wins;
+    otherwise the model's registry engine is used. Bare unknown names are an
+    error naming the known models.
     """
     name = (model or default_model).strip()
     if not name:
@@ -69,7 +71,7 @@ def resolve_model(
                 f"unknown model {name!r}; known models: {known} "
                 f"(or use a provider-qualified id like 'vendor/model')"
             )
-    engine_name = (engine or info.engine or default_engine).strip()
+    engine_name = (engine or default_engine or info.engine).strip().lower()
     return engine_name, name, info
 
 

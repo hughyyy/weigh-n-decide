@@ -2,27 +2,36 @@
 
 One wire format (Jev/SystemOne, `POST /v1/systemone`) serves every backend;
 engines differ only in endpoint resolution and auth. Inputs are validated
-strictly — the server never invents request or response fields.
+strictly — the server never invents request or response fields. Response
+answers are passed through unchanged: validating individual answer shapes
+awaits confirmed card parity across backends (README open question).
 """
 
 from __future__ import annotations
 
+import atexit
 import base64
-from typing import TYPE_CHECKING
+import math
+import time
 
 import httpx
 
-from .images import ImageInputError, load_image
+from .config import ENGINES, load_config
+from .images import ImageInputError, MAX_TOTAL_IMAGE_BYTES, load_image
 from .registry import ModelInfo, resolve_model, vision_capable_models
-
-if TYPE_CHECKING:
-    from .config import Config
 
 __all__ = ["EngineError", "run_decision"]
 
 _QUESTION_TYPES = ("noul", "choice", "score")
 _QUESTION_FIELDS = {"type", "instructions", "criteria"}
+_IMAGE_SPEC_FIELDS = {"image", "ref"}
 _IMAGE_FORMATS = {"png": "png", "jpeg": "jpeg", "jpg": "jpeg"}
+
+# One client per process: TLS sessions and connection pools are reused across
+# calls. httpx.Client is thread-safe, and the MCP SDK runs sync tools on
+# worker threads.
+_CLIENT = httpx.Client()
+atexit.register(_CLIENT.close)
 
 
 class EngineError(ValueError):
@@ -35,11 +44,30 @@ class EngineError(ValueError):
 def _validate_state(state: object) -> None:
     if state is None:
         raise EngineError("state is required (a string or JSON value)")
-    if isinstance(state, bool) or isinstance(state, (int, float, str, list, dict)):
+    if isinstance(state, bool) or isinstance(state, (int, str)):
+        return
+    if isinstance(state, float):
+        if not math.isfinite(state):
+            raise EngineError("state contains a non-finite number")
+        return
+    if isinstance(state, (list, dict)):
+        _validate_finite(state)
         return
     raise EngineError(
         f"state must be a string or JSON value (got {type(state).__name__})"
     )
+
+
+def _validate_finite(root: object) -> None:
+    stack = [root]
+    seen: set[int] = set()
+    while stack:
+        value = stack.pop()
+        if isinstance(value, float) and not math.isfinite(value):
+            raise EngineError("state contains a non-finite number")
+        if isinstance(value, (list, dict)) and id(value) not in seen:
+            seen.add(id(value))
+            stack.extend(value.values() if isinstance(value, dict) else value)
 
 
 def _validate_questions(questions: object) -> None:
@@ -50,7 +78,7 @@ def _validate_questions(questions: object) -> None:
             raise EngineError("question ids must be non-empty strings")
         if not isinstance(question, dict):
             raise EngineError(f"question {qid!r} must be an object")
-        unknown = sorted(set(question) - _QUESTION_FIELDS)
+        unknown = sorted(map(str, set(question) - _QUESTION_FIELDS))
         if unknown:
             raise EngineError(
                 f"question {qid!r}: unknown field(s) {', '.join(unknown)} "
@@ -73,6 +101,10 @@ def _validate_questions(questions: object) -> None:
                     f"object of option id -> description"
                 )
             for oid, desc in criteria.items():
+                if not isinstance(oid, str) or not oid:
+                    raise EngineError(
+                        f"question {qid!r}: criteria option ids must be non-empty strings"
+                    )
                 if not isinstance(desc, str):
                     raise EngineError(
                         f"question {qid!r}: criteria option {oid!r} description must be a string"
@@ -103,6 +135,15 @@ def _validate_questions(questions: object) -> None:
                     raise EngineError(f"question {qid!r}: criteria {key!r} must be a string")
 
 
+class _ImageSpec:
+    __slots__ = ("index", "ref", "source")
+
+    def __init__(self, index: int, ref: str, source: str):
+        self.index = index
+        self.ref = ref
+        self.source = source
+
+
 class _Image:
     __slots__ = ("ref", "media", "b64", "fmt")
 
@@ -113,12 +154,13 @@ class _Image:
         self.fmt = fmt
 
 
-def _resolve_images(images: object) -> list[_Image]:
+def _image_specs(images: object) -> list[_ImageSpec]:
+    """Validate image entries without touching the filesystem or network."""
     if images is None:
         return []
     if not isinstance(images, list) or not images:
         raise EngineError("images must be a non-empty list when given")
-    resolved: list[_Image] = []
+    specs: list[_ImageSpec] = []
     for index, entry in enumerate(images):
         if isinstance(entry, str):
             spec: dict = {"image": entry}
@@ -128,27 +170,61 @@ def _resolve_images(images: object) -> list[_Image]:
             raise EngineError(
                 f"images[{index}] must be a string or an object with an 'image' field"
             )
+        unknown = sorted(map(str, set(spec) - _IMAGE_SPEC_FIELDS))
+        if unknown:
+            raise EngineError(
+                f"images[{index}]: unknown field(s) {', '.join(unknown)} "
+                f"(allowed: image, ref)"
+            )
         source = spec.get("image")
-        if not isinstance(source, str) or not source:
+        if not isinstance(source, str) or not source.strip():
             raise EngineError(f"images[{index}]: 'image' must be a non-empty string")
         ref = spec.get("ref")
         if ref is None:
             ref = f"image_{index}"
-        if not isinstance(ref, str) or not ref:
+        elif not isinstance(ref, str) or not ref.strip():
             raise EngineError(f"images[{index}]: 'ref' must be a non-empty string")
+        else:
+            ref = ref.strip()
+        specs.append(_ImageSpec(index, ref, source))
+    refs = [spec.ref for spec in specs]
+    if len(set(refs)) != len(refs):
+        raise EngineError(f"duplicate image refs: {refs}")
+    return specs
+
+
+def _load_images(
+    specs: list[_ImageSpec], *, url_policy: str, timeout: float, deadline_at: float
+) -> list[_Image]:
+    resolved: list[_Image] = []
+    total = 0
+    for spec in specs:
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise EngineError("overall deadline exceeded while loading images")
         try:
-            media, data = load_image(source)
+            media, data = load_image(
+                spec.source,
+                url_policy=url_policy,
+                timeout=min(timeout, remaining),
+            )
         except ImageInputError as exc:
-            raise EngineError(f"images[{index}] ({ref}): {exc}") from exc
+            raise EngineError(
+                f"images[{spec.index}] ({spec.ref}): {exc}"
+            ) from exc
+        total += len(data)
+        if total > MAX_TOTAL_IMAGE_BYTES:
+            raise EngineError(
+                f"images exceed the "
+                f"{MAX_TOTAL_IMAGE_BYTES // (1024 * 1024)} MiB total limit"
+            )
         fmt = _IMAGE_FORMATS.get(media.rsplit("/", 1)[-1].lower())
         if fmt is None:
             raise EngineError(
-                f"images[{index}] ({ref}): unsupported format {media!r} (png and jpeg)"
+                f"images[{spec.index}] ({spec.ref}): unsupported format {media!r} "
+                f"(png and jpeg)"
             )
-        resolved.append(_Image(ref, media, base64.b64encode(data).decode(), fmt))
-    refs = [img.ref for img in resolved]
-    if len(set(refs)) != len(refs):
-        raise EngineError(f"duplicate image refs: {refs}")
+        resolved.append(_Image(spec.ref, media, base64.b64encode(data).decode(), fmt))
     return resolved
 
 
@@ -177,27 +253,59 @@ def _build_payload(model: str, state: object, questions: dict, imgs: list[_Image
 # --------------------------------------------------------------------------
 # Dispatch
 
-def _resolve_url(engine: str, cfg: "Config") -> tuple[str, dict[str, str]]:
+def _require_http_url(url: str, name: str) -> str:
+    if not url.lower().startswith(("http://", "https://")):
+        raise EngineError(f"{name} must be an http(s) URL (got {url!r})")
+    return url
+
+
+def _resolve_url(engine: str, cfg) -> tuple[str, dict[str, str]]:
     if engine == "selfhosted":
         if not cfg.endpoint:
             raise EngineError(
                 "no self-hosted endpoint configured; set WEIGH_N_DECIDE_ENDPOINT "
                 "to a /v1/systemone base URL (SGLang Clef or decider.serve)"
             )
-        return cfg.endpoint.rstrip("/") + "/v1/systemone", {}
+        endpoint = _require_http_url(
+            cfg.endpoint.rstrip("/"), "WEIGH_N_DECIDE_ENDPOINT"
+        )
+        url = (
+            endpoint
+            if endpoint.lower().endswith("/v1/systemone")
+            else endpoint + "/v1/systemone"
+        )
+        return url, {}
     if engine == "openrouter":
         if not cfg.openrouter_key:
             raise EngineError(
                 "OPENROUTER_API_KEY is not set (required for the openrouter engine)"
             )
-        return cfg.openrouter_url, {"Authorization": f"Bearer {cfg.openrouter_key}"}
-    raise EngineError(f"unknown engine {engine!r} (engines: selfhosted, openrouter)")
+        if not cfg.openrouter_url:
+            raise EngineError(
+                "WEIGH_N_DECIDE_OPENROUTER_URL is empty (needs the full "
+                "System One endpoint URL)"
+            )
+        return (
+            _require_http_url(
+                cfg.openrouter_url, "WEIGH_N_DECIDE_OPENROUTER_URL"
+            ),
+            {"Authorization": f"Bearer {cfg.openrouter_key}"},
+        )
+    raise EngineError(f"unknown engine {engine!r} (engines: {'/'.join(ENGINES)})")
 
 
 def _call_systemone(url: str, headers: dict[str, str], payload: dict, timeout: float) -> dict:
     try:
-        resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+        resp = _CLIENT.post(url, json=payload, headers=headers, timeout=timeout)
     except httpx.HTTPError as exc:
+        raise EngineError(f"request to {url} failed: {exc}") from exc
+    except (ValueError, OverflowError) as exc:
+        # A hand-built Config can carry an invalid timeout; httpx rejects it
+        # before sending. Keep the EngineError contract for callers.
+        raise EngineError(f"request to {url} failed: {exc}") from exc
+    except TypeError as exc:
+        # A non-JSON state or question value fails during encoding; the
+        # request contract says JSON, so surface it as a request error.
         raise EngineError(f"request to {url} failed: {exc}") from exc
     if resp.status_code != 200:
         body = resp.text[:200]
@@ -211,6 +319,8 @@ def _call_systemone(url: str, headers: dict[str, str], payload: dict, timeout: f
             f"malformed SystemOne response from {url}: expected an object "
             f"with an 'answers' object"
         )
+    # Answers are passed through unvalidated; per-backend answer-field parity
+    # is still an open question (README).
     return {
         "model": data.get("model", payload["model"]),
         "answers": data["answers"],
@@ -218,30 +328,67 @@ def _call_systemone(url: str, headers: dict[str, str], payload: dict, timeout: f
     }
 
 
+def _parse_fallback(entry: str) -> tuple[str | None, str | None]:
+    """Split one fallback entry into (engine, model).
+
+    `engine:model` is split only when the prefix is a known engine or an
+    engine-like bare name. A model id whose pre-colon prefix contains `/`
+    stays intact, so OpenRouter ids such as `inception/mercury-decide:free`
+    work without an engine prefix.
+    """
+    entry = entry.strip()
+    if not entry:
+        return None, None
+    if ":" not in entry:
+        return None, entry
+    head, rest = entry.split(":", 1)
+    head = head.strip()
+    model = rest.strip() or None
+    if not head:
+        return None, model
+    if head.lower() in ENGINES or "/" not in head:
+        return head, model
+    return None, entry
+
+
 def _candidates(
-    model: str | None, engine: str | None, cfg: "Config"
-) -> list[tuple[str, str, ModelInfo]]:
+    model: str | None, engine: str | None, cfg
+) -> tuple[list[tuple[str, str, ModelInfo]], list[str]]:
     seen: set[tuple[str, str]] = set()
     candidates: list[tuple[str, str, ModelInfo]] = []
+    errors: list[str] = []
 
-    def add(model_name: str | None, engine_name: str | None) -> None:
+    def add(model_name: str | None, engine_name: str | None, *, required: bool) -> None:
         try:
             resolved = resolve_model(model_name, engine_name, cfg.model, cfg.engine)
         except ValueError as exc:
-            raise EngineError(str(exc)) from exc
+            if required:
+                raise EngineError(str(exc)) from exc
+            errors.append(str(exc))
+            return
         key = (resolved[0], resolved[1])
         if key not in seen:
             seen.add(key)
             candidates.append(resolved)
 
-    add(model, engine)
+    add(model, engine, required=True)
     for fallback in cfg.fallbacks:
-        if ":" in fallback:
-            fb_engine, fb_model = fallback.split(":", 1)
-            add(fb_model.strip() or None, fb_engine.strip())
-        else:
-            add(fallback.strip() or None, None)
-    return candidates
+        fb_engine, fb_model = _parse_fallback(fallback)
+        add(fb_model, fb_engine, required=False)
+    return candidates, errors
+
+
+def _image_support_error(info: ModelInfo, count: int) -> str | None:
+    if info.vision is False:
+        return "no image support"
+    if info.convention is None:
+        return (
+            "no documented image convention "
+            f"(vision-capable: {', '.join(vision_capable_models())})"
+        )
+    if info.max_images is not None and count > info.max_images:
+        return f"max {info.max_images} images (got {count})"
+    return None
 
 
 def run_decision(
@@ -250,40 +397,57 @@ def run_decision(
     images: object = None,
     model: str | None = None,
     engine: str | None = None,
-    cfg: "Config | None" = None,
+    cfg=None,
 ) -> dict:
     """Validate inputs, then dispatch through the engine/fallback chain.
 
     Returns the normalized SystemOne response: {"model", "answers", "usage"}.
     Raises EngineError with every failed attempt when nothing succeeds.
     """
-    from .config import Config as _Config
-
-    cfg = cfg or _Config()
+    cfg = cfg or load_config()
     _validate_state(state)
     _validate_questions(questions)
-    imgs = _resolve_images(images)
+    specs = _image_specs(images)
 
-    attempts = _candidates(model, engine, cfg)
-    errors: list[str] = []
-    for eng, name, info in attempts:
-        if imgs:
-            if info.vision is False:
-                errors.append(f"{eng}:{name}: no image support")
-                continue
-            if info.convention is None:
-                errors.append(
-                    f"{eng}:{name}: no documented image convention "
-                    f"(vision-capable: {', '.join(vision_capable_models())})"
-                )
-                continue
-            if info.max_images is not None and len(imgs) > info.max_images:
-                errors.append(f"{eng}:{name}: max {info.max_images} images (got {len(imgs)})")
-                continue
+    started = time.monotonic()
+    attempts, errors = _candidates(model, engine, cfg)
+
+    supported: set[int] = set()
+    if specs:
+        for index, (eng, name, info) in enumerate(attempts):
+            problem = _image_support_error(info, len(specs))
+            if problem is None:
+                supported.add(index)
+            else:
+                errors.append(f"{eng}:{name}: {problem}")
+        if not supported:
+            raise EngineError("all engine attempts failed — " + "; ".join(errors))
+
+    imgs: list[_Image] = []
+    if specs:
+        remaining = cfg.deadline - (time.monotonic() - started)
+        if remaining <= 0:
+            raise EngineError("overall deadline exceeded before image loading")
+        imgs = _load_images(
+            specs,
+            url_policy=cfg.image_url_policy,
+            timeout=cfg.timeout,
+            deadline_at=started + cfg.deadline,
+        )
+
+    for index, (eng, name, info) in enumerate(attempts):
+        if specs and index not in supported:
+            continue
+        remaining = cfg.deadline - (time.monotonic() - started)
+        if remaining <= 0:
+            errors.append(f"{eng}:{name}: overall deadline exceeded")
+            break
         try:
             payload = _build_payload(name, state, questions, imgs, info)
             url, headers = _resolve_url(eng, cfg)
-            return _call_systemone(url, headers, payload, cfg.timeout)
+            return _call_systemone(
+                url, headers, payload, min(cfg.timeout, remaining)
+            )
         except EngineError as exc:
             errors.append(f"{eng}:{name}: {exc}")
     raise EngineError("all engine attempts failed — " + "; ".join(errors))
