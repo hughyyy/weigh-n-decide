@@ -9,6 +9,10 @@ from mcp.server.mcpserver import MCPServer
 from . import conditions, engines
 from .config import Config, load_config
 
+# The questions API takes a state as a string or any JSON value. Spelled out
+# (rather than `object`) so the generated tool schema documents what is valid;
+# the engine re-checks and rejects None and non-JSON values with a clear error.
+StateValue = bool | int | float | str | list | dict
 
 
 def create_server(cfg: Config | None = None) -> MCPServer:
@@ -19,7 +23,7 @@ def create_server(cfg: Config | None = None) -> MCPServer:
 
     @mcp.tool()
     def decide(
-        state: str | dict | list,
+        state: StateValue,
         questions: dict,
         model: str | None = None,
         engine: str | None = None,
@@ -40,7 +44,7 @@ def create_server(cfg: Config | None = None) -> MCPServer:
     @mcp.tool()
     def vision_decide(
         images: list,
-        state: str | dict | list,
+        state: StateValue,
         questions: dict,
         model: str | None = None,
         engine: str | None = None,
