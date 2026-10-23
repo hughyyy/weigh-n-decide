@@ -116,6 +116,11 @@ but literals, fact paths, and these operators:
   `items[0].price`, `user.roles`). JSON escapes (`\/`, `\b`, `\f`, `\uXXXX`)
   follow the standard; raw newlines inside strings are rejected.
 
+Keywords are reserved where the grammar needs them: a bare `not` starts a
+negation and `true`/`false`/`null` are literals, so facts with those names are
+not addressable as bare paths. After a dot, all keywords are rejected as key
+names.
+
 Facts are a JSON object passed per call. A missing fact path is an error, not
 a silent `false`. Expressions are capped at 20,000 characters / 5,000 tokens
 and 100 explicit nesting levels (parentheses, `not`, list literals).
