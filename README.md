@@ -12,7 +12,7 @@ locally, with no model in the loop. Fifth in the collection:
 [listen-n-speak](../listen-n-speak) (speech), weigh-n-decide (decisions).
 
 > **Status: v1 implemented** — tools, engines, registry, and condition
-> evaluator are live (76-test offline suite; `scripts/stdio_smoke.py` drives
+> evaluator are live (379-test offline suite; `scripts/stdio_smoke.py` drives
 > the real stdio server). `BRIEF.md` holds requirements, `IMPLEMENTATION.md`
 > the design. The open questions at the bottom gate only what remains.
 
@@ -64,11 +64,18 @@ the caller can threshold, compare, or defer.
 | --- | --- | --- |
 | `decide` | `state` (required: string or JSON), `questions` (required: map of typed questions), `model`?, `engine`? | `answers` per question id (normalized), `model`, `usage` |
 | `vision_decide` | same as `decide` plus `images` (required: list of input-triple entries, optional `ref` each) | same; images folded into the state per backend convention |
-| `evaluate` | `conditions` (required: one expression or list), `facts`? (JSON object) | per-condition boolean `result` + `trace`; optional `all`/`any` aggregate |
+| `evaluate` | `conditions` (required: one expression or list), `facts`? (JSON object) | per-condition boolean `result` + `trace`; `all`/`any` aggregate |
 
 House rules: images use the same input triple as look-n-see (file path /
 base64 `data:` URI / `http(s)://` URL); every tool returns structured JSON,
 never prose-only; `evaluate` never touches the network.
+
+Image inputs are agent-supplied, so the server bounds them: 25 MiB per image,
+100 MiB total per call, bounded reads (a large `Content-Length` is rejected
+before the body is read), regular files only for paths, http(s)-only
+redirects, and — by default — URL hosts must resolve to globally routable
+addresses. Set `WEIGH_N_DECIDE_IMAGE_URL_POLICY=any` to allow loopback or
+private targets explicitly.
 
 ## Backends
 
@@ -78,9 +85,11 @@ never prose-only; `evaluate` never touches the network.
 | `openrouter` | OpenRouter's System One endpoint | inception/mercury-decide (and `:free`), openai/gpt-6-luna-decisions | `OPENROUTER_API_KEY` |
 
 Selection per call via `engine=`/`model=`, default via env, fallback chain
-after failure — identical semantics to look-n-see's OCR dispatcher. A plain
-instruct model (Muse2-230M and friends) is not SystemOne-compatible and is out
-of scope for v1.
+after failure — identical semantics to look-n-see's OCR dispatcher. A model's
+registry engine is used unless `engine=` or `WEIGH_N_DECIDE_ENGINE` explicitly
+overrides it; unknown model ids containing `/` default to `openrouter`. Bare
+unknown model names are errors. A plain instruct model (Muse2-230M and
+friends) is not SystemOne-compatible and is out of scope for v1.
 
 ## Vision decision models
 
@@ -99,27 +108,32 @@ A small whitelisted grammar — recursive-descent parser, no `eval()`, nothing
 but literals, fact paths, and these operators:
 
 - Boolean: `and`, `or`, `not`, parentheses; short-circuit evaluation (the
-  trace records where it stopped)
+  trace records where it stopped). Parentheses group whole expressions and
+  can also wrap operands (`(a.total) > 100`, `a == (1)`).
 - Comparison: `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `not in`, `contains`
-- Operands: JSON literals (`5`, `"paid"`, `true`, `null`, `[1, 2]`), and
-  **fact paths** — dotted/indexed references into `facts` (`a.total`,
-  `items[0].price`, `user.roles`)
+- Operands: JSON literals (`5`, `1.5e3`, `"paid"`, `true`, `null`, `[1, 2]`)
+  and **fact paths** — dotted/indexed references into `facts` (`a.total`,
+  `items[0].price`, `user.roles`). JSON escapes (`\/`, `\b`, `\f`, `\uXXXX`)
+  follow the standard; raw newlines inside strings are rejected.
 
 Facts are a JSON object passed per call. A missing fact path is an error, not
-a silent `false`. Arithmetic and functions are deliberately out of v1 scope
-(decided with the user); the grammar can grow later without changing the
-surface.
+a silent `false`. Expressions are capped at 20,000 characters / 5,000 tokens
+and 100 explicit nesting levels (parentheses, `not`, list literals).
+Arithmetic and functions are deliberately out of v1 scope (decided with the
+user); the grammar can grow later without changing the surface.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `WEIGH_N_DECIDE_ENGINE` | `selfhosted` | default engine |
-| `WEIGH_N_DECIDE_ENDPOINT` | — | base URL for `selfhosted` (SGLang / decider.serve) |
-| `WEIGH_N_DECIDE_MODEL` | engine-dependent | default decision model |
-| `WEIGH_N_DECIDE_FALLBACKS` | — | fallback engines/models tried after the default fails (`engine:model` or `model`, comma-separated) |
+| `WEIGH_N_DECIDE_ENGINE` | model's own engine | default engine override (`selfhosted` or `openrouter`); unknown values surface as a call-time error |
+| `WEIGH_N_DECIDE_ENDPOINT` | — | base URL for `selfhosted` (SGLang / decider.serve); a full `.../v1/systemone` URL is also accepted |
+| `WEIGH_N_DECIDE_MODEL` | `clef` | default decision model |
+| `WEIGH_N_DECIDE_FALLBACKS` | — | fallback engines/models tried after the default fails (`engine:model` or `model`, comma-separated; model ids containing `/` or `:` are supported) |
 | `WEIGH_N_DECIDE_OPENROUTER_URL` | `https://openrouter.ai/api/v1/systemone` | full System One endpoint for the `openrouter` engine (route unverified — open question) |
-| `WEIGH_N_DECIDE_TIMEOUT` | `60` | per-request HTTP timeout in seconds |
+| `WEIGH_N_DECIDE_TIMEOUT` | `60` | per-request HTTP timeout in seconds for SystemOne calls and image fetches; blank, non-numeric, non-finite, or non-positive values fall back to the default |
+| `WEIGH_N_DECIDE_DEADLINE` | `120` | overall budget in seconds for one `decide`/`vision_decide` call, including image loading and every fallback attempt |
+| `WEIGH_N_DECIDE_IMAGE_URL_POLICY` | `public` | `public` rejects loopback/link-local/private image URL targets; `any` allows them |
 | `OPENROUTER_API_KEY` | — | `openrouter` engine only; env only, never committed |
 
 ## Install
